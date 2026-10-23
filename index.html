@@ -1,0 +1,206 @@
+using UnityEngine;
+using UnityEngine.UI;
+using UnityEngine.EventSystems;
+using UnityEngine.SceneManagement;
+
+// ============================================================================
+// 1. HỆ THỐNG PHÍM ĐIỀU KHIỂN TRÒN (JOYSTICK)
+// ============================================================================
+public class WePlayJoystick : MonoBehaviour, IDragHandler, IPointerUpHandler, IPointerDownHandler
+{
+    public RectTransform joystickBackground;
+    public RectTransform joystickHandle;
+    [HideInInspector] public Vector2 inputVector = Vector2.zero;
+
+    public void OnDrag(PointerEventData eventData)
+    {
+        Vector2 pos;
+        if (RectTransformUtility.ScreenPointToLocalPointInRectangle(joystickBackground, eventData.position, eventData.pressEventCamera, out pos))
+        {
+            pos.x = pos.x / joystickBackground.sizeDelta.x;
+            pos.y = pos.y / joystickBackground.sizeDelta.y;
+
+            inputVector = new Vector2(pos.x * 2, pos.y * 2);
+            inputVector = (inputVector.magnitude > 1.0f) ? inputVector.normalized : inputVector;
+
+            joystickHandle.anchoredPosition = new Vector2(
+                inputVector.x * (joystickBackground.sizeDelta.x / 2), 
+                inputVector.y * (joystickBackground.sizeDelta.y / 2)
+            );
+        }
+    }
+
+    public void OnPointerDown(PointerEventData eventData)
+    {
+        OnDrag(eventData);
+    }
+
+    public void OnPointerUp(PointerEventData eventData)
+    {
+        inputVector = Vector2.zero;
+        joystickHandle.anchoredPosition = Vector2.zero;
+    }
+}
+
+// ============================================================================
+// 2. QUẢN LÝ GAME: DI CHUYỂN FPS, VA CHẠM, ĐIỆN THOẠI ĐỊNH VỊ & CỬA HÀNG XE
+// ============================================================================
+public class WePlayDeliveryGame : MonoBehaviour
+{
+    [Header("--- ĐIỀU KHIỂN XE (FPS) ---")]
+    public WePlayJoystick joystick; 
+    public float moveSpeed = 15f;   
+    public float turnSpeed = 100f;  
+
+    [Header("--- HỆ THỐNG GIAO HÀNG & ĐỊNH VỊ ---")]
+    public Transform[] deliveryPoints;  // Các điểm hàng quán (Hủ tiếu, Bánh mì...)
+    public Text stateText;              // Chữ hiển thị "ĐI ĐẾN ĐIỂM LẤY HÀNG"
+    public LineRenderer navigationLine; // Đường vẽ màu xanh trên bản đồ điện thoại
+
+    [Header("--- TIỀN & MUA XE MỚI ---")]
+    public Text moneyText;          
+    public int bikePrice = 5000;    
+    public GameObject currentBikeVisual; 
+    public GameObject newBikeVisual;     
+
+    private Rigidbody rb;
+    private int currentMoney;
+    private bool isUpgraded = false;
+    private Transform currentTarget;
+    private bool hasCargo = false;
+
+    void Start()
+    {
+        rb = GetComponent<Rigidbody>();
+        if (rb == null) rb = gameObject.AddComponent<Rigidbody>();
+        
+        // Khóa trục X và Z để xe máy góc nhìn thứ nhất không bị ngã nghiêng khi chạy
+        rb.constraints = RigidbodyConstraints.FreezeRotationX | RigidbodyConstraints.FreezeRotationZ;
+
+        // Tải dữ liệu lưu trữ từ bộ nhớ máy
+        currentMoney = PlayerPrefs.GetInt("PlayerMoney", 0);
+        isUpgraded = PlayerPrefs.GetInt("IsUpgraded", 0) == 1;
+        
+        if (isUpgraded && newBikeVisual != null)
+        {
+            if (currentBikeVisual != null) currentBikeVisual.SetActive(false);
+            newBikeVisual.SetActive(true);
+        }
+        UpdateMoneyUI();
+
+        // Cấu hình nét vẽ định vị màu xanh lá giống như trong app điện thoại ngoài đời
+        if (navigationLine == null) navigationLine = gameObject.AddComponent<LineRenderer>();
+        navigationLine.startWidth = 0.5f;
+        navigationLine.endWidth = 0.5f;
+        navigationLine.positionCount = 2;
+        navigationLine.material = new Material(Shader.Find("Sprites/Default"));
+        navigationLine.startColor = Color.green;
+        navigationLine.endColor = Color.green;
+        navigationLine.useWorldSpace = true;
+
+        SelectNextTarget();
+    }
+
+    void FixedUpdate()
+    {
+        if (joystick == null) return;
+
+        // Đẩy phím lên/xuống để tiến lùi - Đẩy sang trái/phải để quẹo hẻm vuông góc
+        float moveInput = joystick.inputVector.y;
+        float turnInput = joystick.inputVector.x;
+
+        Vector3 movement = transform.forward * moveInput * moveSpeed * Time.fixedDeltaTime;
+        rb.MovePosition(rb.position + movement);
+
+        float turnRotation = turnInput * turnSpeed * Time.fixedDeltaTime;
+        Quaternion turnOffset = Quaternion.Euler(0f, turnRotation, 0f);
+        rb.MoveRotation(rb.rotation * turnOffset);
+    }
+
+    void Update()
+    {
+        UpdateNavigationAndDelivery();
+    }
+
+    void UpdateNavigationAndDelivery()
+    {
+        if (currentTarget == null) return;
+
+        // Tính khoảng cách đến điểm lấy/giao hàng
+        float distance = Vector3.Distance(transform.position, currentTarget.position);
+
+        if (distance < 3f) 
+        {
+            if (!hasCargo)
+            {
+                hasCargo = true;
+                SelectNextTarget();
+            }
+            else
+            {
+                hasCargo = false;
+                AddMoney(1000); // Giao xong một đơn hàng được cộng 1.000 đ
+                SelectNextTarget();
+            }
+        }
+
+        // Vẽ đường định vị màu xanh hiển thị thời gian thực lên bản đồ điện thoại
+        navigationLine.SetPosition(0, new Vector3(transform.position.x, transform.position.y + 0.1f, transform.position.z));
+        navigationLine.SetPosition(1, new Vector3(currentTarget.position.x, currentTarget.position.y + 0.1f, currentTarget.position.z));
+    }
+
+    void SelectNextTarget()
+    {
+        if (deliveryPoints == null || deliveryPoints.Length == 0) return;
+
+        int randomIndex = Random.Range(0, deliveryPoints.Length);
+        currentTarget = deliveryPoints[randomIndex];
+
+        if (stateText != null)
+        {
+            stateText.text = (!hasCargo) ? "ĐI ĐẾN ĐIỂM LẤY HÀNG" : "ĐI ĐẾN ĐIỂM GIAO HÀNG";
+        }
+    }
+
+    // NẾU TÔNG TRÚNG XE CHẠY TRÊN ĐƯỜNG -> LÀM LẠI TỪ ĐẦU
+    private void OnCollisionEnter(Collision collision)
+    {
+        // Gắn Tag "AI_Vehicle" cho các phương tiện giao thông rải rác trên đường
+        if (collision.gameObject.CompareTag("AI_Vehicle"))
+        {
+            SceneManager.LoadScene(SceneManager.GetActiveScene().name);
+        }
+    }
+
+    // Hàm sự kiện khi bấm nút "MUA XE" trên giao diện
+    public void ClickBuyVehicleButton()
+    {
+        if (!isUpgraded && currentMoney >= bikePrice)
+        {
+            currentMoney -= bikePrice;
+            isUpgraded = true;
+            
+            PlayerPrefs.SetInt("PlayerMoney", currentMoney);
+            PlayerPrefs.SetInt("IsUpgraded", 1);
+            PlayerPrefs.Save();
+
+            if (currentBikeVisual != null) currentBikeVisual.SetActive(false);
+            if (newBikeVisual != null) newBikeVisual.SetActive(true);
+            
+            UpdateMoneyUI();
+        }
+    }
+
+    public void AddMoney(int amount)
+    {
+        currentMoney += amount;
+        PlayerPrefs.SetInt("PlayerMoney", currentMoney);
+        PlayerPrefs.Save();
+        UpdateMoneyUI();
+    }
+
+    void UpdateMoneyUI()
+    {
+        if (moneyText != null) moneyText.text = "Tiền: " + currentMoney + " đ";
+    }
+}
